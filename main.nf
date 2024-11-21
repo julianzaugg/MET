@@ -124,6 +124,7 @@ process extract_adaptive_readID {
         label "cpu"
         label "high_memory"
         publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: "*.log", saveAs: { filename -> "${sample}_$filename" }
+        publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: "*.txt", saveAs: { filename -> "${sample}_$filename" }
         input:
                 tuple val(sample), path(reads), path(csv)
         output:
@@ -135,11 +136,25 @@ process extract_adaptive_readID {
         shell:
         '''
         set +eu
-	awk -F, '$7 == "stop_receiving" {print $0}' !{csv} | cut -d"," -f5 | sort | uniq > adaptive_reads.txt	
+	
+	awk -F, '$7 == "stop_receiving" {print $0}' !{csv} | cut -d"," -f5 | sort | uniq | sort > readID_stop_receiving.txt
+	awk -F, '$7 == "no_decision" {print $0}' !{csv} | cut -d"," -f5 | sort | uniq | sort > readID_no_decision.txt
+	awk -F, '$7 == "unblock" {print $0}' !{csv} | cut -d"," -f5 | sort | uniq | sort > readID_unblock.txt
+	comm -12 readID_no_decision.txt readID_unblock.txt > comm_nodecision_unblock.txt 
+	awk -v FS="[\t= ]" ' FNR==NR { a[$1]=$1; next } !($1 in a){print $0}' readID_no_decision.txt readID_unblock.txt > readID_unblock_not_no_decision.txt
+	cat readID_unblock_not_no_decision.txt comm_nodecision_unblock.txt | sort | uniq > readID_unblock_unique.txt 
+	awk -v FS="[\t= ]" ' FNR==NR { a[$1]=$1; next } !($1 in a){print $0}' readID_unblock.txt readID_no_decision.txt > readID_unique_no_decision_unblock.txt
+	awk -v FS="[\t= ]" ' FNR==NR { a[$1]=$1; next } !($1 in a){print $0}' readID_stop_receiving.txt readID_unique_no_decision_unblock.txt > readID_no_decision_unique.txt
+
+	if [ !{params.read_types_retain} == "stop_receiving" ];then
+		cp readID_stop_receiving.txt adaptive_reads.txt
+	elif [ !{params.read_types_retain} == "stop_receiving__no_decision" ]; then
+		cat readID_stop_receiving.txt readID_no_decision.txt | sort | uniq > adaptive_reads.txt
+	fi
+	#awk -F, '$7 == "stop_receiving" {print $0}' !{csv} | cut -d"," -f5 | sort | uniq > adaptive_reads.txt	
 	seqkit fx2tab !{reads} | awk '{print $1, $5}' - | sed 's/=/ /' | cut -d" " -f1,3 | awk '$2 > 256 {print $1}' - | sort | uniq > non_adaptive_reads.txt   
 	cp .command.log extract_adaptive_readID.log
         '''
-
 }
 
 process extract_adaptive_fastq {
@@ -173,6 +188,7 @@ process extract_adaptive_sampling_reads {
 	publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: "*.log", saveAs: { filename -> "${sample}_$filename" }
 	publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: "*_version.txt"
 	publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: '*fastq', saveAs: { filename -> "${sample}_$filename" }
+        publishDir "$params.outdir/$sample/2_adaptive",  mode: 'copy', pattern: '*txt', saveAs: { filename -> "${sample}_$filename" }
 	input:	
 		tuple val(sample), path(reads), path(csv)
 	output:
@@ -180,6 +196,7 @@ process extract_adaptive_sampling_reads {
 		path("extract_adaptive_fastq.log")
 		path("*nodecision.fastq")
 		path("unblock.fastq")
+		path("*txt")
 	when:
 	!params.skip_adaptive_sampling_metrics
 	shell:
@@ -198,7 +215,7 @@ process extract_adaptive_sampling_reads {
 	seqtk subseq !{reads} readID_unblock_unique.txt > unblock.fastq
 	nb_reads=`cut -d"," -f5  !{csv} | tail -n +2 | sort | uniq | sort | wc -l`
 	echo -e !{sample}\\t$nb_reads >> nbReads_AS_csv.txt
- 	cp .command.log extract_adaptive_fastq.log
+	cp .command.log extract_adaptive_fastq.log
 	'''
 }
 
@@ -245,18 +262,17 @@ process minimap {
 	shell:
 	'''
 	set +eu
-	module load samtools/1.13-gcc-10.3.0 seqtk/1.3-gcc-10.3.0
-	/scratch/project/gihcomp/sw/minimap2/minimap2 -t !{params.minimap_threads} -ax map-ont !{params.ref_genome} !{fastq_non_adaptive} > non_adaptive.sam
-	/scratch/project/gihcomp/sw/minimap2/minimap2 -t !{params.minimap_threads} -ax map-ont !{params.ref_genome} !{fastq_adaptive} > adaptive.sam
+	minimap2 -t !{params.minimap_threads} -ax map-ont !{params.ref_genome} !{fastq_non_adaptive} > non_adaptive.sam
+	minimap2 -t !{params.minimap_threads} -ax map-ont !{params.ref_genome} !{fastq_adaptive} > adaptive.sam
 	for type in adaptive non_adaptive; do
 		samtools sort -o ${type}.bam -@ !{params.minimap_threads} ${type}.sam
 		samtools index ${type}.bam 
 		samtools flagstat ${type}.bam > ${type}.flagstat.txt
 		samtools view -S -f 4 -b ${type}.bam -o ${type}_non_host.unsorted.bam
 		samtools sort -o ${type}_non_host.bam -@ !{params.minimap_threads} ${type}_non_host.unsorted.bam
-  		samtools index ${type}_non_host.bam
- 		samtools flagstat ${type}_non_host.bam > ${type}_non_host.flagstat.txt
-        	samtools view ${type}_non_host.bam | cut -f1 | sort | uniq > ${type}_non_host_readID.lst
+		samtools index ${type}_non_host.bam
+		samtools flagstat ${type}_non_host.bam > ${type}_non_host.flagstat.txt
+		samtools view ${type}_non_host.bam | cut -f1 | sort | uniq > ${type}_non_host_readID.lst
 	done
 	seqtk subseq !{fastq_adaptive} adaptive_non_host_readID.lst > adaptive_bac.fastq
 	seqtk subseq !{fastq_non_adaptive} non_adaptive_non_host_readID.lst > non_adaptive_bac.fastq
@@ -486,6 +502,7 @@ process whokaryote {
 	tag "${sample}"
 	publishDir "$params.outdir/$sample/7_whokaryote",  mode: 'copy', pattern: "{*sv}", saveAs: { filename -> "${sample}_$filename" }
 	publishDir "$params.outdir/$sample/7_whokaryote",  mode: 'copy', saveAs: { filename -> "${sample}_$filename" }
+	errorStrategy = 'ignore'
 	input:
 		tuple val(sample), path(fastq_adaptive_bac), path(adaptive_assembly), path(fastq_non_adaptive_bac), path(non_adaptive_assembly)
 	output:
@@ -530,7 +547,7 @@ process download_genomad_db {
     """
     echo ${db}
     wget ${db}
-    tar -xvf genomad_db_v1.5.tar.gz
+    tar -xvf genomad_db_v1.7.tar.gz
     """
 }
 
@@ -583,14 +600,14 @@ process aviary_recover {
 	input:
 		tuple val(sample), path(fastq_adaptive_bac), path(adaptive_assembly), path(fastq_non_adaptive_bac), path(non_adaptive_assembly)
 	output:
-		path("${sample}_adaptive/bins/*"), emit: bins
-		path("${sample}_adaptive/data/*"), emit: data
-		path("${sample}_adaptive/diversity/*"), emit: diversity
-		path("${sample}_adaptive/benchmarks/*"), emit: benchmarks
-		path("${sample}_non_adaptive/bins/*"), emit: non_adaptive_bins
-		path("${sample}_non_adaptive/data/*"), emit: non_adaptive_data
-		path("${sample}_non_adaptive/diversity/*"), emit: non_adaptive_diversity
-		path("${sample}_non_adaptive/benchmarks/*"), emit: non_adaptive_benchmarks
+		path("${sample}_adaptive/bins/*"), emit: bins, optional: true
+		path("${sample}_adaptive/data/*"), emit: data, optional: true
+		path("${sample}_adaptive/diversity/*"), emit: diversity, optional: true
+		path("${sample}_adaptive/benchmarks/*"), emit: benchmarks, optional: true
+		path("${sample}_non_adaptive/bins/*"), emit: non_adaptive_bins, optional: true
+		path("${sample}_non_adaptive/data/*"), emit: non_adaptive_data, optional: true
+		path("${sample}_non_adaptive/diversity/*"), emit: non_adaptive_diversity, optional: true
+		path("${sample}_non_adaptive/benchmarks/*"), emit: non_adaptive_benchmarks, optional: true
 		path("aviary.log")
 	when:
 	!params.skip_aviary | !params.skip_assembly
@@ -604,15 +621,14 @@ process aviary_recover {
 	--n-cores ${params.aviary_threads} \
 	--skip-binners semibin \
 	--max_threads ${params.aviary_threads} \
-	--pplacer_threads ${params.pplacer_threads} \
 	--max_memory ${params.max_memory_aviary} \
 	--checkm2-db-path ${params.checkm_db} \
 	--gtdb-path ${params.gtdb_path} \
 	--eggnog-db-path ${params.eggnog_db} \
 	--workflow recover_mags \
-	--output \$PWD
-	mkdir ${sample}_adaptive
-	mv data/ bins/ benchmarks/ diversity/ config.yaml ${sample}_adaptive/
+        --output \$PWD/${sample}_adaptive
+        #mkdir ${sample}_adaptive
+        #mv data/ bins/ benchmarks/ diversity/ config.yaml ${sample}_adaptive/
 	aviary recover \
 	--assembly ${non_adaptive_assembly} \
 	--longreads ${fastq_non_adaptive_bac} \
@@ -620,16 +636,15 @@ process aviary_recover {
 	--n-cores ${params.aviary_threads} \
 	--skip-binners semibin \
 	--max_threads ${params.aviary_threads} \
-	--pplacer_threads ${params.pplacer_threads} \
 	--max_memory ${params.max_memory_aviary} \
 	--checkm2-db-path ${params.checkm_db} \
 	--gtdb-path ${params.gtdb_path} \
 	--eggnog-db-path ${params.eggnog_db} \
 	--workflow recover_mags \
-	--output \$PWD
-	mkdir ${sample}_non_adaptive
-	mv data/ bins/ benchmarks/ diversity/ config.yaml ${sample}_non_adaptive/
- 	cp .command.log aviary.log
+        --output \$PWD/${sample}_non_adaptive
+        #mkdir ${sample}_non_adaptive
+        #mv data/ bins/ benchmarks/ diversity/ config.yaml ${sample}_non_adaptive/
+	cp .command.log aviary.log
 	"""
 }
 
@@ -653,10 +668,6 @@ process quast {
 }
 
 workflow {
-	ch_centrifuge_db=Channel.value( "${params.centrifuge_db}")
-	ch_centrifuge_db.view()
-	ch_genomad_db=Channel.value( "${params.genomad_db}" )
-    	ch_genomad_db.view()
 	Channel.fromPath( "${params.samplesheet}", checkIfExists:true )
 	.splitCsv(header:true, sep:',')
 	.map { row -> tuple(row.sample_id, file(row.fastq, checkIfExists: true), file(row.csv, checkIfExists: true)) }
@@ -674,13 +685,14 @@ workflow {
 		compute_adaptive_sampling_metrics(extract_adaptive_sampling_reads.out.extracted_fastq)
 	}
 	minimap(extract_adaptive_fastq.out.extracted_fastq)
+
 	if (!params.skip_centrifuge) {
 		if (!params.skip_download_centrifuge_db) {
-			centrifuge_download_db(ch_centrifuge_db)
+			centrifuge_download_db(Channel.value( "${params.centrifuge_db_remote}"))
 			centrifuge(minimap.out.bacterial_fastq.combine(centrifuge_download_db.out.centrifuge_db))
-		} else if (params.skip_download_centrifuge_db) {		        
-			ch_centrifuge_db=Channel.fromPath( "${params.outdir}/centrifuge_database/*.cf" ).collect()
-			centrifuge(minimap.out.bacterial_fastq.combine(ch_centrifuge_db))			
+		} else if (params.skip_download_centrifuge_db) {	        
+			ch_centrifuge_db=Channel.fromPath( "${params.centrifuge_db}/*.cf" ).collect()
+			centrifuge(minimap.out.bacterial_fastq.combine(ch_centrifuge_db))
 		}
 		remove_centrifuge_contaminated(centrifuge.out.bacterial_fastq)
 		if (!params.skip_krona) {
@@ -695,13 +707,13 @@ workflow {
 				if (!params.skip_whokaryote) {
 					whokaryote(medaka.out.polished_medaka)
 				}
-                if (!params.skip_genomad) {
+				if (!params.skip_genomad) {
 					if (!params.skip_download_genomad_db) {
-                    	download_genomad_db(ch_genomad_db)
-                    	genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
-                	} else if (params.skip_download_genomad_db) {
-                    	ch_genomad_db=Channel.fromPath( "${params.outdir}/genomad_database/genomad_db/" ).collect()
-                    	genomad(medaka.out.polished_medaka.combine(ch_genomad_db))
+						download_genomad_db(Channel.value( "${params.genomad_db_remote}" ))
+						genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
+					} else if (params.skip_download_genomad_db) {
+						ch_genomad_db=Channel.fromPath( "${params.genomad_db}/" ).collect()
+						genomad(medaka.out.polished_medaka.combine(ch_genomad_db))
 					}
 				}
 				if (!params.skip_aviary) {
@@ -710,17 +722,18 @@ workflow {
 				if (!params.skip_quast) {
 					quast(medaka.out.polished_medaka)
 				}
-            } else if (params.skip_polishing) {
+			} else if (params.skip_polishing) {
 				if (!params.skip_whokaryote) {
-                	whokaryote(flye.out.bacterial_assembly_fasta)
+					whokaryote(flye.out.bacterial_assembly_fasta)
 				}
 				if (!params.skip_genomad) {
-                	if (!params.skip_download_genomad_db) {
-                    	download_genomad_db(ch_genomad_db)
-                    	genomad(flye.out.bacterial_assembly_fasta.combine(download_genomad_db.out.genomad_db))
-               		} else if (params.skip_download_genomad_db) {
-                    	ch_genomad_db=Channel.fromPath( "${params.outdir}/genomad_database/genomad_db/" ).collect()
-                    	genomad(flye.out.bacterial_assembly_fasta.combine(ch_genomad_db)) }
+					if (!params.skip_download_genomad_db) {
+						download_genomad_db(Channel.value( "${params.genomad_db_remote}" ))
+						genomad(flye.out.bacterial_assembly_fasta.combine(download_genomad_db.out.genomad_db))
+					} else if (params.skip_download_genomad_db) {
+						ch_genomad_db=Channel.fromPath( "${params.genomad_db}/").collect()
+						genomad(flye.out.bacterial_assembly_fasta.combine(ch_genomad_db)) 
+					}
 				}
 				if (!params.skip_aviary) {
 					aviary_recover(flye.out.bacterial_assembly_fasta)
@@ -728,46 +741,48 @@ workflow {
 				if (!params.skip_quast) {
 					quast(flye.out.bacterial_assembly_fasta)
 				}
-            }
-        }
+			}
+		}
         }  else if (params.skip_centrifuge) {
-        if (!params.skip_assembly) {
-            flye(minimap.out.bacterial_fastq)
-            if (!params.skip_polishing) {
-                racon(flye.out.bacterial_assembly_fasta)
-                medaka(racon.out.polished_racon)
-                if (!params.skip_whokaryote) {
+		if (!params.skip_assembly) {
+			flye(minimap.out.bacterial_fastq)
+			if (!params.skip_polishing) {
+				racon(flye.out.bacterial_assembly_fasta)
+				medaka(racon.out.polished_racon)
+				if (!params.skip_whokaryote) {
 					whokaryote(medaka.out.polished_medaka)
 				}
-                if (!params.skip_download_genomad_db) {
-                    download_genomad_db(ch_genomad_db)
-                    genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
-               } else if (params.skip_download_genomad_db) {
-                    ch_genomad_db=Channel.fromPath( "${params.outdir}/genomad_database/genomad_db/" ).collect() }
-                    genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
+				if (!params.skip_download_genomad_db) {
+					download_genomad_db(Channel.value( "${params.genomad_db_remote}" ))
+					genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
+				} else if (params.skip_download_genomad_db) {
+					ch_genomad_db=Channel.fromPath( "${params.genomad_db}/" ).collect()
+					genomad(medaka.out.polished_medaka.combine(download_genomad_db.out.genomad_db))
+				}
 				if (!params.skip_aviary) {
 					aviary_recover(medaka.out.polished_medaka)
 				}
 				if (!params.skip_quast) {
 					quast(medaka.out.polished_medaka)
 				}
-            } else if (params.skip_polishing) {
+			} else if (params.skip_polishing) {
 				if (!params.skip_whokaryote) {
-                	whokaryote(flye.out.bacterial_assembly_fasta)
+					whokaryote(flye.out.bacterial_assembly_fasta)
 				}
-                if (!params.skip_download_genomad_db) {
-                    download_genomad_db(ch_genomad_db)
-                    genomad(flye.out.bacterial_assembly_fasta.combine(download_genomad_db.out.genomad_db))
-               } else if (params.skip_download_genomad_db) {
-                    ch_genomad_db=Channel.fromPath( "${params.outdir}/genomad_database/genomad_db/" ).collect()
-					genomad(flye.out.bacterial_assembly_fasta.combine(ch_genomad_db)) }
+				if (!params.skip_download_genomad_db) {
+					download_genomad_db(Channel.value( "${params.genomad_db_remote}" ))
+					genomad(flye.out.bacterial_assembly_fasta.combine(download_genomad_db.out.genomad))
+				} else if (params.skip_download_genomad_db) {
+					ch_genomad_db=Channel.fromPath( "${params.genomad_db}/" ).collect()
+					genomad(flye.out.bacterial_assembly_fasta.combine(ch_genomad_db))
+				}
 				if (!params.skip_aviary) {
 					aviary_recover(flye.out.bacterial_assembly_fasta)
 				}
 				if (!params.skip_quast) {
 					quast(flye.out.bacterial_assembly_fasta)
 				}
-            }
-        }
-    }
+			}
+		}
+	}
 }
